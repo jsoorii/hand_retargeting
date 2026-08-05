@@ -234,8 +234,66 @@ class ThumbKinematics:
 
     @property
     def r_min(self) -> float:
-        # conservative: keep away from the CMC singularity
+        # crude fallback only; prefer the envelope below
         return max(0.25 * self.r_max, abs(self.d) + 1e-3)
+
+    def envelope(self) -> "ReachEnvelope":
+        if getattr(self, "_env", None) is None:
+            self._env = build_reach_envelope(self)
+        return self._env
+
+
+@dataclass
+class ReachEnvelope:
+    """Reachable radius as a function of elevation, in the digit's flexion
+    plane, derived from the ACTUAL joint limits.
+
+    A scalar [r_min, r_max] is badly wrong for a 3R chain: the inner boundary
+    is set by how far the chain can fold, which depends strongly on elevation
+    and is usually far larger than any fraction of the outer reach. Using a
+    scalar leaves a whole band of targets that pass the workspace projection
+    and then fail IK, and a digit whose IK fails just holds -- which the
+    operator experiences as the hand refusing to follow in one direction.
+    """
+
+    theta: np.ndarray
+    r_lo: np.ndarray
+    r_hi: np.ndarray
+
+    def bounds(self, th: float) -> tuple[float, float]:
+        t = float(np.clip(th, self.theta[0], self.theta[-1]))
+        return (float(np.interp(t, self.theta, self.r_lo)),
+                float(np.interp(t, self.theta, self.r_hi)))
+
+    @property
+    def theta_range(self) -> tuple[float, float]:
+        return float(self.theta[0]), float(self.theta[-1])
+
+
+def build_reach_envelope(kin: "ThumbKinematics", n_grid: int = 21,
+                         n_bins: int = 48) -> ReachEnvelope:
+    """One-time sampling of the planar chain over its joint-limit box."""
+    g = [np.linspace(kin.q_min[i], kin.q_max[i], n_grid) for i in (1, 2, 3)]
+    Q1, Q2, Q3 = np.meshgrid(*g, indexing="ij")
+    b = Q1 + Q2 + Q3
+    u = (kin.L1 * np.cos(Q1) + kin.L2 * np.cos(Q1 + Q2) + kin.L3 * np.cos(b))
+    v = (kin.L1 * np.sin(Q1) + kin.L2 * np.sin(Q1 + Q2) + kin.L3 * np.sin(b))
+    th = np.arctan2(v, u).ravel()
+    r = np.hypot(u, v).ravel()
+
+    edges = np.linspace(th.min(), th.max(), n_bins + 1)
+    idx = np.clip(np.digitize(th, edges) - 1, 0, n_bins - 1)
+    centers, lo, hi = [], [], []
+    for k in range(n_bins):
+        m = idx == k
+        if not np.any(m):
+            continue
+        centers.append(0.5 * (edges[k] + edges[k + 1]))
+        lo.append(r[m].min())
+        hi.append(r[m].max())
+    if len(centers) < 2:
+        raise ValueError("degenerate reach envelope; check joint limits")
+    return ReachEnvelope(np.array(centers), np.array(lo), np.array(hi))
 
 
 # ----------------------------------------------------------------------------
@@ -263,6 +321,88 @@ def soft_saturate_radius(p: np.ndarray, r_min: float, r_max: float,
     else:
         r_new = r
     return u * r_new, saturated
+
+
+def soft_saturate_planar(p: np.ndarray, env: "ReachEnvelope", d: float = 0.0,
+                         knee: float = 0.9,
+                         margin: float = 0.002) -> tuple[np.ndarray, bool]:
+    """Saturate the target into the digit's true reachable region.
+
+    Works in the flexion plane (rho, zeta), compressing BOTH the elevation and
+    the radius against the envelope, so every direction degrades smoothly and
+    no target is ever handed to the IK that the IK cannot solve.
+
+    `margin` pulls the clamp strictly INSIDE the boundary. Landing exactly on
+    the envelope makes the solution set measure-zero, and the 1-degree beta
+    grid then steps straight over it -- the IK reports failure on a target that
+    is nominally reachable. A couple of millimetres of margin costs nothing and
+    removes that whole failure class.
+    """
+    rho2 = p[0] ** 2 + p[1] ** 2 - d * d
+    rho = np.sqrt(max(rho2, 0.0))
+    zeta = p[2]
+    r = float(np.hypot(rho, zeta))
+    if r < 1e-9:
+        return p, True
+    th = float(np.arctan2(zeta, rho))
+    sat = False
+
+    th_lo, th_hi = env.theta_range
+    th_m = min(margin / max(r, 1e-6), 0.25 * (th_hi - th_lo))
+    if th < th_lo + th_m or th > th_hi - th_m:
+        th = float(np.clip(th, th_lo + th_m, th_hi - th_m))
+        sat = True
+
+    r_lo, r_hi = env.bounds(th)
+    r_lo, r_hi = r_lo + margin, r_hi - margin
+    if r_hi <= r_lo:
+        r_lo = r_hi = 0.5 * (r_lo + r_hi)
+    r0 = r_lo + knee * (r_hi - r_lo)
+    if r > r0 and r_hi > r0:
+        r = r0 + (r_hi - r0) * np.tanh((r - r0) / (r_hi - r0))
+        sat = True
+    elif r < r_lo:
+        r, sat = r_lo, True
+
+    rho_n, zeta_n = r * np.cos(th), r * np.sin(th)
+    # rebuild the 3D point on the same azimuth
+    azim = np.arctan2(p[1], p[0]) - np.arctan2(d, max(rho, 1e-9))
+    q = rotz(azim) @ np.array([rho_n, d, zeta_n])
+    return q, sat
+
+
+def soft_saturate_yaw(p: np.ndarray, q0_min: float, q0_max: float,
+                      d: float = 0.0, knee: float = 0.8) -> tuple[np.ndarray, bool]:
+    """Compress the target's AZIMUTH toward the first joint's limits.
+
+    Why this exists: the radial saturation above only handles reach. The yaw /
+    AA joint has its own, usually much tighter, limit, and a hard clamp there
+    produces exactly the symptom that shows up when the thumb swings toward the
+    pinky -- the digit tracks fine and then simply stops moving laterally, a
+    dead zone in one direction while the other axes keep responding. That reads
+    to the operator as "the model can't follow", when really it is a boundary
+    with no gradient.
+
+    Compressing the azimuth instead keeps the mapping monotonic: lateral motion
+    keeps producing lateral motion, just progressively less of it, so the user
+    feels the limit rather than hitting a wall.
+    """
+    rho2 = p[0] ** 2 + p[1] ** 2 - d * d
+    if rho2 <= 1e-12:
+        return p, False
+    rho = np.sqrt(rho2)
+    phi = np.arctan2(p[1], p[0]) - np.arctan2(d, rho)      # required q0
+
+    mid = 0.5 * (q0_min + q0_max)
+    half = 0.5 * (q0_max - q0_min)
+    if half <= 1e-9:
+        return p, False
+    e = phi - mid
+    e0 = knee * half
+    if abs(e) <= e0:
+        return p, False
+    e_new = np.sign(e) * (e0 + (half - e0) * np.tanh((abs(e) - e0) / (half - e0)))
+    return rotz(e_new - e) @ p, True
 
 
 # ----------------------------------------------------------------------------
@@ -384,7 +524,14 @@ class ThumbIK:
         if best is None:
             # window empty -> retry once globally (re-engage / large jump)
             if q_prev is not None:
-                return self.solve(p_des, R_des, None)
+                res = self.solve(p_des, R_des, None)
+                if res.ok:
+                    return res
+                # still nothing: HOLD. Returning a fresh configuration here
+                # would make the digit snap across the workspace at exactly the
+                # moment tracking is hardest.
+                return IKResult(q_prev.copy(), float(q_prev[1:].sum()),
+                                False, np.inf)
             return IKResult(np.zeros(4), 0.0, False, np.inf)
         return best
 
@@ -480,9 +627,13 @@ class ThumbRetargeter:
         to happen in a common palm frame, before the per-digit base transform.
         In that path this object's own filters are bypassed.
         """
-        # 4) soft workspace saturation
-        p_cmd, ws_sat = soft_saturate_radius(p_f, self.kin.r_min,
-                                             self.kin.r_max)
+        # 4) soft saturation: azimuth first (it changes rho), then the
+        #    reachable envelope in the flexion plane
+        p_cmd, yaw_sat = soft_saturate_yaw(p_f, self.kin.q_min[0],
+                                           self.kin.q_max[0], self.kin.d)
+        p_cmd, plane_sat = soft_saturate_planar(p_cmd, self.kin.envelope(),
+                                                self.kin.d)
+        ws_sat = yaw_sat or plane_sat
 
         # 5) IK
         res = self.ik.solve(p_cmd, R_f, self.q_prev)
